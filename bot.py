@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""qBittorrent Telegram Bot — final audited version.
+"""qBittorrent Telegram Bot
 
 Environment variables (loaded from .env or exported):
     BOT_TOKEN         – Telegram bot token from @BotFather
@@ -8,6 +8,7 @@ Environment variables (loaded from .env or exported):
 All other settings live in config.json.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -59,20 +60,125 @@ PERSISTENT_KB = ReplyKeyboardMarkup(
     is_persistent=True,
 )
 
+# States that mean "download finished" (transitioning here triggers notification)
+DONE_STATES = {
+    "uploading", "pausedUP", "stoppedUP", "queuedUP", "stalledUP",
+}
 
-async def post_init(application):
-    """Send welcome message + keyboard on startup."""
-    for uid in application.bot_data.get("allowed_users", set()):
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _qb(ctx):
+    """Return the shared QBClient instance."""
+    return ctx.bot_data["qb"]
+
+
+def _is_authorized(uid, allowed):
+    return uid in allowed
+
+
+# ---------------------------------------------------------------------------
+# Background notification poller (defined before post_init which calls it)
+# ---------------------------------------------------------------------------
+async def _notify_all(app, text):
+    for uid in app.bot_data.get("allowed_users", set()):
         try:
-            await application.bot.send_message(
+            await app.bot.send_message(chat_id=uid, text=text, parse_mode="HTML")
+        except Exception as e:
+            logger.warning("Notification to %s failed: %s", uid, e)
+
+
+async def notification_poller(app):
+    """Periodically poll qBittorrent and notify on add / completion."""
+    cfg = _qb(app).config
+    interval = max(10, cfg.get("notification_interval", 30))
+    notify_add = cfg.get("notify_on_add", True)
+    notify_done = cfg.get("notify_on_complete", True)
+
+    if not notify_add and not notify_done:
+        logger.info("Notifications disabled – poller idle")
+        return
+
+    logger.info("Notification poller running every %ds (add=%s, done=%s)",
+                interval, notify_add, notify_done)
+
+    # known_hashes = plain set of hashes we've seen
+    known_hashes = app.bot_data.get("known_hashes", set())
+    # known_states = {hash: state} for completion detection
+    known_states = app.bot_data.get("known_states", {})
+
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            torrents = await _qb(app).list_torrents()
+            current_hashes = {t.hash for t in torrents}
+            current_states = {t.hash: t.state for t in torrents}
+
+            for t in torrents:
+                h = t.hash
+                # --- new torrent ---
+                if notify_add and h not in known_hashes:
+                    await _notify_all(app,
+                        f"✅ <b>Torrent added</b>\n<code>{t.name}</code>")
+
+                # --- torrent completed ---
+                elif notify_done:
+                    old_state = known_states.get(h)
+                    if old_state and old_state != t.state:
+                        if t.state in DONE_STATES:
+                            sz = t.size
+                            if sz >= 1_073_741_824:
+                                sz_str = f"{sz / 1_073_741_824:.1f} GB"
+                            elif sz >= 1_048_576:
+                                sz_str = f"{sz / 1_048_576:.1f} MB"
+                            else:
+                                sz_str = f"{sz / 1024:.1f} KB"
+                            await _notify_all(app,
+                                f"🎉 <b>Torrent complete</b>\n<code>{t.name}</code>\n"
+                                f"Size: {sz_str}  |  Ratio: {t.ratio:.2f}")
+
+            known_hashes = current_hashes
+            known_states = current_states
+            app.bot_data["known_hashes"] = known_hashes
+            app.bot_data["known_states"] = known_states
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error("Notification poller error: %s", e)
+            await asyncio.sleep(interval)
+
+
+# ---------------------------------------------------------------------------
+# post_init  (starts notifier + seeds tracker)
+# ---------------------------------------------------------------------------
+async def post_init(app):
+    """Send welcome message, seed known torrents, start notification poller."""
+    for uid in app.bot_data.get("allowed_users", set()):
+        try:
+            await app.bot.send_message(
                 chat_id=uid,
                 text="☠️ qbittorrent bot is online\\. Send /help to get started\\.",
                 parse_mode="MarkdownV2",
                 reply_markup=PERSISTENT_KB,
             )
-            logger.info("Sent persistent menu to user %s", uid)
+            logger.info("Sent welcome to user %s", uid)
         except Exception as e:
             logger.warning("Could not message user %s: %s", uid, e)
+
+    # Seed known torrents so we don't spam on startup
+    try:
+        torrents = await _qb(app).list_torrents()
+        app.bot_data["known_hashes"] = {t.hash for t in torrents}
+        app.bot_data["known_states"] = {t.hash: t.state for t in torrents}
+        logger.info("Tracker seeded with %d torrents", len(torrents))
+    except Exception as e:
+        app.bot_data["known_hashes"] = set()
+        app.bot_data["known_states"] = {}
+        logger.warning("Could not seed tracker: %s", e)
+
+    # Launch background poller
+    asyncio.create_task(notification_poller(app))
 
 
 # ---------------------------------------------------------------------------
@@ -94,16 +200,6 @@ def load_config():
         with open(cfg_path) as f:
             defaults.update(json.load(f))
     return defaults
-
-
-def _qb(ctx):
-    """Return the shared QBClient instance."""
-    return ctx.bot_data["qb"]
-
-
-def _is_authorized(uid, allowed):
-    """Check auth given a user-id string (sync, testable)."""
-    return uid in allowed
 
 
 # ---------------------------------------------------------------------------
@@ -177,18 +273,14 @@ async def cmd_paused(update, context: ContextTypes.DEFAULT_TYPE):
 # /add conversation
 # ---------------------------------------------------------------------------
 async def add_start(update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return ConversationHandler.END
-    if not _is_authorized(str(update.effective_user.id), context.bot_data["allowed_users"]):
+    if not update.message or not _is_authorized(str(update.effective_user.id), context.bot_data["allowed_users"]):
         return ConversationHandler.END
     context.user_data["paused"] = False
     return await _show_categories(update, context)
 
 
 async def add_paused_start(update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return ConversationHandler.END
-    if not _is_authorized(str(update.effective_user.id), context.bot_data["allowed_users"]):
+    if not update.message or not _is_authorized(str(update.effective_user.id), context.bot_data["allowed_users"]):
         return ConversationHandler.END
     context.user_data["paused"] = True
     return await _show_categories(update, context)
@@ -204,7 +296,7 @@ async def _show_categories(update, context):
         )
     except Exception as e:
         logger.error("Category selection failed: %s", e)
-        await update.message.reply_text("Something went wrong\\. Try /add again or send /cancel\\.", parse_mode="MarkdownV2")
+        await update.message.reply_text("Something went wrong\\. Try again or send /cancel\\.", parse_mode="MarkdownV2")
         return ConversationHandler.END
     return CATEGORY
 
@@ -212,8 +304,7 @@ async def _show_categories(update, context):
 async def category_choice(update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     cfg = _qb(context).config
-    save_path = None
-    cat_name = None
+    save_path = cat_name = None
     for c in cfg.get("categories", []):
         if c["name"] == text:
             save_path = c["save_path"]
@@ -226,8 +317,7 @@ async def category_choice(update, context: ContextTypes.DEFAULT_TYPE):
             "Magnet / URL   or   .torrent file?",
             reply_markup=ReplyKeyboardMarkup(
                 [[KeyboardButton("Magnet/URL"), KeyboardButton(".torrent File")]],
-                one_time_keyboard=True,
-                resize_keyboard=True,
+                one_time_keyboard=True, resize_keyboard=True,
             ),
         )
     except Exception as e:
@@ -266,21 +356,18 @@ async def torrent_input_handle(update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("That doesn't look like a .torrent file\\. Try again or /cancel\\.", parse_mode="MarkdownV2")
             return TORRENT_INPUT
         try:
-            file_obj  = await context.bot.get_file(doc.file_id)
-            content   = await file_obj.download_as_bytearray()
+            file_obj = await context.bot.get_file(doc.file_id)
+            content = await file_obj.download_as_bytearray()
         except Exception as e:
             await update.message.reply_text(f"Failed to download file: {e}")
             return ConversationHandler.END
         ok, msg = await qb.add_torrent_file(content, save_path=sp, paused=paused, category=cat)
     else:
-        await update.message.reply_text("Internal error: /add cancelled\\.", parse_mode="MarkdownV2")
+        await update.message.reply_text("Internal error – try again or send /cancel\\.", parse_mode="MarkdownV2")
         return ConversationHandler.END
 
-    if ok:
-        await update.message.reply_text(f"✅ {msg}")
-    else:
-        await update.message.reply_text(f"❌ {msg}")
-
+    emoji = "✅" if ok else "❌"
+    await update.message.reply_text(f"{emoji} {msg}")
     return ConversationHandler.END
 
 
@@ -296,14 +383,11 @@ async def cancel_convo(update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 # Direct magnet / .torrent (outside conversations)
 # ---------------------------------------------------------------------------
-
 def _in_conversation(user_data):
-    """Return True when a /add or /addpaused flow is active."""
     return "input_type" in user_data or "paused" in user_data
 
 
 async def on_magnet_text(update, context: ContextTypes.DEFAULT_TYPE):
-    """Accept a magnet link sent as plain text (only when NOT in a conversation)."""
     if not update.message:
         return
     if _in_conversation(context.user_data):
@@ -317,7 +401,6 @@ async def on_magnet_text(update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_torrent_doc(update, context: ContextTypes.DEFAULT_TYPE):
-    """Accept a .torrent file as document (only when NOT in a conversation)."""
     if not update.message:
         return
     if _in_conversation(context.user_data):
@@ -329,7 +412,7 @@ async def on_torrent_doc(update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         file_obj = await context.bot.get_file(doc.file_id)
-        content   = await file_obj.download_as_bytearray()
+        content = await file_obj.download_as_bytearray()
     except Exception as e:
         await update.message.reply_text(f"Failed to download file: {e}")
         return
@@ -361,14 +444,14 @@ def build_app():
     app.bot_data["allowed_users"] = allowed
     app.bot_data["qb"] = qb
 
-    # --- Commands ---
+    # Commands
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("down", cmd_down))
     app.add_handler(CommandHandler("up", cmd_up))
     app.add_handler(CommandHandler("paused", cmd_paused))
 
-    # --- /add ---
+    # /add
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("add", add_start)],
         states={
@@ -382,7 +465,7 @@ def build_app():
         fallbacks=[CommandHandler("cancel", cancel_convo)],
     ))
 
-    # --- /addpaused ---
+    # /addpaused
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("addpaused", add_paused_start)],
         states={
@@ -396,17 +479,13 @@ def build_app():
         fallbacks=[CommandHandler("cancel", cancel_convo)],
     ))
 
-    # --- Direct magnet / .torrent ---
+    # Direct magnet / torrent
     app.add_handler(MessageHandler(
-        filters.Regex(r"(?i)^magnet:\?") & ~filters.COMMAND,
-        on_magnet_text,
+        filters.Regex(r"(?i)^magnet:\?") & ~filters.COMMAND, on_magnet_text,
     ))
-    app.add_handler(MessageHandler(
-        filters.Document.ALL,
-        on_torrent_doc,
-    ))
+    app.add_handler(MessageHandler(filters.Document.ALL, on_torrent_doc))
 
-    # --- Error handler ---
+    # Error handler
     async def error_handler(update, context):
         logger.error("Update %s caused error: %s", update, context.error)
     app.add_error_handler(error_handler)
