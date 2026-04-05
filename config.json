@@ -1,0 +1,15 @@
+{
+    "qb_url": "http://localhost:8080",
+    "qb_username": "your-qb-username",
+    "qb_password": "your-qb-password",
+    "notify_on_add": true,
+    "notify_on_complete": true,
+    "torrent_list_limit": 10,
+    "torrent_format": "detailed",
+    "categories": [
+        {"name": "Movies",   "save_path": "/path/to/movies"},
+        {"name": "Music",    "save_path": "/path/to/music"},
+        {"name": "Software", "save_path": "/path/to/software"},
+        {"name": "Default",  "save_path": ""}
+    ]
+}

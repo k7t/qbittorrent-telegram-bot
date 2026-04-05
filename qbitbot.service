@@ -1,0 +1,17 @@
+[Unit]
+Description=qBittorrent Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=kevin
+WorkingDirectory=/home/kevin/qbittorrent-telegram-bot
+Environment=PATH=/home/kevin/qbittorrent-telegram-bot/.venv/bin
+ExecStart=/home/kevin/qbittorrent-telegram-bot/.venv/bin/python3 /home/kevin/qbittorrent-telegram-bot/bot.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/home/kevin/qbittorrent-telegram-bot/bot.log
+StandardError=append:/home/kevin/qbittorrent-telegram-bot/bot.log
+
+[Install]
+WantedBy=default.target
